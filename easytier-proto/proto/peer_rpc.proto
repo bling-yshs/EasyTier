@@ -233,6 +233,13 @@ message SendPunchPacketHardSymRequest {
   uint32 transaction_id = 3;
   uint32 port_index = 4;
   uint32 round = 5;
+
+  // Paced batch scan used by NAT4 -> NAT3 punching. When non-zero the
+  // receiver sends a single pass over `scan_port_count` ports starting at
+  // `port_index`, one packet per port every `scan_packet_interval_ms`. Peers
+  // that do not know these fields fall back to the legacy random scan.
+  uint32 scan_port_count = 6;
+  uint32 scan_packet_interval_ms = 7;
 }
 
 message SendPunchPacketHardSymResponse { uint32 next_port_index = 1; }

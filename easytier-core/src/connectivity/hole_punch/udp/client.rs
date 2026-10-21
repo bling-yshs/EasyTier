@@ -15,6 +15,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::{
     config::PeerId,
     connectivity::stun::StunInfoProvider,
+    foundation::time::{self, Duration},
     packet::{HOLE_PUNCH_PACKET_BODY_LEN, new_hole_punch_packet},
     socket::udp::{UdpBindOptions, VirtualUdpSocket},
 };
@@ -39,6 +40,21 @@ const UDP_ARRAY_SIZE_FOR_HARD_SYM: usize = 84;
 const UDP_ARRAY_SIZE_FOR_BOTH_EASY_SYM: usize = 25;
 const DST_PORT_OFFSET: u16 = 20;
 const REMOTE_WAIT_TIME_MS: u64 = 5000;
+
+// NAT4 -> NAT3 schedule. NAT4 rotates batches of fresh sockets to keep probing
+// new public mappings, while NAT3 repeatedly scans a random batch of ports.
+const NAT4_SOCKETS_PER_BATCH: usize = 150;
+const NAT4_BATCH_LIFETIME: Duration = Duration::from_secs(6);
+const NAT4_PROBES_PER_SOCKET: u32 = 3;
+const NAT4_PROBE_INTERVAL: Duration = Duration::from_millis(1500);
+// Each probe round walks the whole batch over this window instead of bursting.
+const NAT4_PROBE_ROUND_SPREAD: Duration = Duration::from_millis(1000);
+const NAT4_PUNCHED_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const NAT3_SCAN_PORTS_PER_BATCH: u32 = 500;
+const NAT3_SCAN_PACKET_INTERVAL_MS: u32 = 10;
+const NAT3_SCAN_PASSES_PER_BATCH: u32 = 4;
+const NAT3_SCAN_PASS_INTERVAL: Duration = Duration::from_secs(5);
+const NAT3_SCAN_BATCH_PAUSE: Duration = Duration::from_secs(5);
 
 pub fn apply_peer_easy_sym_port_offset(base_port: u16, peer_is_incremental: bool) -> u16 {
     let port = if peer_is_incremental {
@@ -288,6 +304,8 @@ where
             transaction_id: tid,
             round,
             port_index,
+            scan_port_count: 0,
+            scan_packet_interval_ms: 0,
         };
         tracing::debug!(?req, "send punch packet for hard sym start");
         match signaling.send_punch_packet_hard_sym(dst_peer_id, req).await {
@@ -443,6 +461,183 @@ where
             *last_port_idx = next_port_idx as usize;
         } else {
             *last_port_idx = rand::random();
+        }
+
+        Ok(ret_socket)
+    }
+
+    /// Drives NAT3's side of one scan cycle: the same batch of ports is scanned
+    /// `NAT3_SCAN_PASSES_PER_BATCH` times, one paced RPC per pass, with passes
+    /// started `NAT3_SCAN_PASS_INTERVAL` apart. Returns the index of the next
+    /// batch reported by the remote.
+    async fn remote_scan_nat3_ports(
+        signaling: Arc<S>,
+        dst_peer_id: PeerId,
+        remote_mapped_addr: SocketAddr,
+        public_ips: Vec<Ipv4Addr>,
+        tid: u32,
+        port_index: u32,
+    ) -> Option<u32> {
+        let start = time::Instant::now();
+        let mut next_port_index = None;
+        for pass in 0..NAT3_SCAN_PASSES_PER_BATCH {
+            time::sleep_until(start + NAT3_SCAN_PASS_INTERVAL * pass).await;
+            let req = SendPunchPacketHardSym {
+                listener_mapped_addr: remote_mapped_addr,
+                public_ips: public_ips.clone(),
+                transaction_id: tid,
+                // Peers without paced scan support fall back to the legacy
+                // scan; round 1 keeps it at full width there.
+                round: 1,
+                port_index,
+                scan_port_count: NAT3_SCAN_PORTS_PER_BATCH,
+                scan_packet_interval_ms: NAT3_SCAN_PACKET_INTERVAL_MS,
+            };
+            tracing::debug!(?req, pass, "send paced punch packet for nat3 scan");
+            match signaling.send_punch_packet_hard_sym(dst_peer_id, req).await {
+                Ok(resp) => next_port_index = Some(resp.next_port_index),
+                Err(e) => tracing::warn!(?e, pass, "failed to run nat3 scan pass"),
+            }
+        }
+        next_port_index
+    }
+
+    /// Runs one batch of fresh NAT4 sockets until `deadline`: every socket
+    /// sends `NAT4_PROBES_PER_SOCKET` probes `NAT4_PROBE_INTERVAL` apart, and any
+    /// socket that hears NAT3's scan is used to connect immediately.
+    async fn run_nat4_socket_batch(
+        &self,
+        tid: u32,
+        packet: &bytes::Bytes,
+        remote_mapped_addr: SocketAddr,
+        deadline: time::Instant,
+    ) -> anyhow::Result<Option<UdpPunchSocket>> {
+        let udp_array = Arc::new(UdpSocketArray::new_with_context(
+            NAT4_SOCKETS_PER_BATCH,
+            self.runtime.clone(),
+            self.runtime.socket_context(),
+        ));
+        udp_array.add_interest_tid(tid);
+        udp_array.start().await?;
+
+        let batch_start = time::Instant::now();
+        let deadline = deadline.min(batch_start + NAT4_BATCH_LIFETIME);
+        let _probe_task = AbortOnDropHandle::new(tokio::spawn({
+            let udp_array = udp_array.clone();
+            let packet = packet.clone();
+            async move {
+                for probe in 0..NAT4_PROBES_PER_SOCKET {
+                    time::sleep_until(batch_start + NAT4_PROBE_INTERVAL * probe).await;
+                    udp_array
+                        .send_once_with_all_paced(
+                            &packet,
+                            remote_mapped_addr,
+                            NAT4_PROBE_ROUND_SPREAD,
+                        )
+                        .await;
+                }
+            }
+        }));
+
+        loop {
+            while let Some(punched) = udp_array.try_fetch_punched_socket(tid) {
+                tracing::info!(?punched, "nat4 socket got nat3 punch packet");
+                match self
+                    .runtime
+                    .connect_with_socket(punched.socket, remote_mapped_addr)
+                    .await
+                {
+                    // Dropping the batch closes every other candidate socket.
+                    Ok(socket) => return Ok(Some(socket)),
+                    Err(e) => tracing::error!(?e, "failed to connect with socket"),
+                }
+            }
+
+            let now = time::Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            time::sleep((deadline - now).min(NAT4_PUNCHED_POLL_INTERVAL)).await;
+        }
+    }
+
+    /// NAT4 -> NAT3 hole punching with a fixed schedule. One call covers one
+    /// NAT3 scan cycle (all passes of one port batch plus the pause before the
+    /// next batch) while NAT4 keeps rotating socket batches throughout.
+    #[tracing::instrument(err(level = tracing::Level::ERROR), skip(self))]
+    pub async fn do_hole_punching_nat4_to_nat3(
+        &self,
+        dst_peer_id: PeerId,
+        last_port_idx: &mut usize,
+    ) -> UdpHolePunchClientResult<Option<UdpPunchSocket>> {
+        let resp = self
+            .signaling
+            .select_punch_listener(
+                dst_peer_id,
+                SelectPunchListener {
+                    force_new: false,
+                    prefer_port_mapping: true,
+                    transaction_id: None,
+                },
+            )
+            .await?;
+
+        let remote_mapped_addr = resp.listener_mapped_addr;
+
+        if self.try_direct_connect.load(Ordering::Relaxed) {
+            let socket = self.runtime.bind_direct_connect_udp().await?;
+            if let Ok(socket) = self
+                .runtime
+                .connect_with_socket(socket, remote_mapped_addr)
+                .await
+            {
+                return Ok(Some(socket));
+            }
+        }
+
+        let stun_info = self.stun.get_stun_info();
+        let public_ips: Vec<Ipv4Addr> = stun_info
+            .public_ip
+            .iter()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        if public_ips.is_empty() {
+            return Err(anyhow::anyhow!("failed to get public ips").into());
+        }
+
+        let tid = rand::thread_rng().r#gen();
+        let packet = new_hole_punch_packet(tid, HOLE_PUNCH_PACKET_BODY_LEN).into_bytes();
+
+        let cycle_start = time::Instant::now();
+        let cycle_deadline = cycle_start
+            + NAT3_SCAN_PASS_INTERVAL * NAT3_SCAN_PASSES_PER_BATCH
+            + NAT3_SCAN_BATCH_PAUSE;
+        let scan_task = AbortOnDropHandle::new(tokio::spawn(Self::remote_scan_nat3_ports(
+            self.signaling.clone(),
+            dst_peer_id,
+            remote_mapped_addr,
+            public_ips,
+            tid,
+            *last_port_idx as u32,
+        )));
+
+        let mut ret_socket = None;
+        while time::Instant::now() < cycle_deadline {
+            ret_socket = self
+                .run_nat4_socket_batch(tid, &packet, remote_mapped_addr, cycle_deadline)
+                .await?;
+            if ret_socket.is_some() {
+                break;
+            }
+        }
+
+        if ret_socket.is_none() {
+            let next_port_idx = if scan_task.is_finished() {
+                scan_task.await.ok().flatten()
+            } else {
+                None
+            };
+            *last_port_idx = next_port_idx.map_or_else(rand::random, |idx| idx as usize);
         }
 
         Ok(ret_socket)

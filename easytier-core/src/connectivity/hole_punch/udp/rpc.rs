@@ -29,6 +29,9 @@ use crate::{
 const CONE_RPC_TIMEOUT_MS: i32 = 4000;
 const SYMMETRIC_RPC_TIMEOUT_MS: i32 = 4000;
 const BOTH_EASY_SYMMETRIC_RPC_TIMEOUT_MS: i32 = 2000;
+// A paced hard-sym scan pass runs for `port_count * interval` on the remote,
+// which exceeds SYMMETRIC_RPC_TIMEOUT_MS; allow that plus this margin.
+const HARD_SYM_SCAN_RPC_TIMEOUT_MARGIN_MS: i32 = 3000;
 
 fn cone_controller() -> BaseController {
     BaseController {
@@ -40,6 +43,23 @@ fn cone_controller() -> BaseController {
 fn symmetric_controller() -> BaseController {
     BaseController {
         timeout_ms: SYMMETRIC_RPC_TIMEOUT_MS,
+        trace_id: 0,
+        ..Default::default()
+    }
+}
+
+fn hard_symmetric_controller(request: &SendPunchPacketHardSym) -> BaseController {
+    if request.scan_port_count == 0 {
+        return symmetric_controller();
+    }
+    let scan_ms = request
+        .scan_port_count
+        .saturating_mul(request.scan_packet_interval_ms.max(1));
+    BaseController {
+        timeout_ms: i32::try_from(scan_ms)
+            .unwrap_or(i32::MAX)
+            .saturating_add(HARD_SYM_SCAN_RPC_TIMEOUT_MARGIN_MS)
+            .max(SYMMETRIC_RPC_TIMEOUT_MS),
         trace_id: 0,
         ..Default::default()
     }
@@ -108,6 +128,8 @@ fn hard_symmetric_request_to_rpc(request: SendPunchPacketHardSym) -> SendPunchPa
         transaction_id: request.transaction_id,
         port_index: request.port_index,
         round: request.round,
+        scan_port_count: request.scan_port_count,
+        scan_packet_interval_ms: request.scan_packet_interval_ms,
     }
 }
 
@@ -275,7 +297,7 @@ where
         let response = self
             .rpc_stub(dst_peer_id)
             .send_punch_packet_hard_sym(
-                symmetric_controller(),
+                hard_symmetric_controller(&request),
                 hard_symmetric_request_to_rpc(request),
             )
             .await
@@ -396,6 +418,8 @@ fn hard_symmetric_request_from_rpc(
         transaction_id: input.transaction_id,
         port_index: input.port_index,
         round: input.round,
+        scan_port_count: input.scan_port_count,
+        scan_packet_interval_ms: input.scan_packet_interval_ms,
     })
 }
 
@@ -696,6 +720,8 @@ mod tests {
             transaction_id: 13,
             port_index: 17,
             round: 19,
+            scan_port_count: 0,
+            scan_packet_interval_ms: 0,
         };
 
         let rpc = hard_symmetric_request_to_rpc(request.clone());

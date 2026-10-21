@@ -27,6 +27,8 @@ use super::{
     collect_udp_punch_tasks, punch_cone_to_cone, should_blacklist_signal_error,
 };
 
+const NAT4_TO_NAT3_RETRY_DELAY_MS: u64 = 1000;
+
 #[derive(Clone, Default)]
 pub struct UdpSymPunchLock {
     inner: Arc<Mutex<()>>,
@@ -257,8 +259,16 @@ where
 
     #[tracing::instrument(skip(self))]
     async fn sym_to_cone(self: Arc<Self>, task_info: UdpPunchTaskInfo) -> Result<(), Error> {
-        let mut backoff =
-            BackOff::new(vec![1000, 1000, 2000, 4000, 4000, 8000, 8000, 16000, 64000]);
+        let nat4_to_nat3 = task_info
+            .my_nat_type
+            .is_nat4_to_nat3(task_info.dst_nat_type);
+        // NAT4 -> NAT3 keeps a fixed schedule: each attempt already spans a full
+        // scan cycle, so failures never stretch the gap between attempts.
+        let mut backoff = if nat4_to_nat3 {
+            BackOff::new(vec![NAT4_TO_NAT3_RETRY_DELAY_MS])
+        } else {
+            BackOff::new(vec![1000, 1000, 2000, 4000, 4000, 8000, 8000, 16000, 64000])
+        };
         let mut round = 0;
         let mut port_idx = rand::random();
 
@@ -287,14 +297,20 @@ where
 
             let ret = {
                 let _lock = self.sym_punch_lock.lock().await;
-                self.sym_to_cone_client
-                    .do_hole_punching(
-                        task_info.dst_peer_id,
-                        round,
-                        &mut port_idx,
-                        task_info.my_nat_type,
-                    )
-                    .await
+                if nat4_to_nat3 {
+                    self.sym_to_cone_client
+                        .do_hole_punching_nat4_to_nat3(task_info.dst_peer_id, &mut port_idx)
+                        .await
+                } else {
+                    self.sym_to_cone_client
+                        .do_hole_punching(
+                            task_info.dst_peer_id,
+                            round,
+                            &mut port_idx,
+                            task_info.my_nat_type,
+                        )
+                        .await
+                }
             };
             let ret = self.map_client_result(task_info.dst_peer_id, ret);
 

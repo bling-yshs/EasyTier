@@ -35,6 +35,9 @@ use super::{
 };
 
 const MAX_K1_FOR_RANDOM_HARD_SYM: u32 = 180;
+// Bounds for a paced NAT4 -> NAT3 scan pass requested by the remote peer.
+const MAX_HARD_SYM_SCAN_PORTS: usize = 1000;
+const MAX_HARD_SYM_SCAN_PACKET_INTERVAL_MS: u32 = 20;
 // Selection precedes local socket/STUN preparation. Match the listener's
 // selection lifetime so abandoned preparations expire without per-RPC tasks.
 const PREPARED_CONE_PUNCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -224,6 +227,35 @@ where
         }
 
         let last_port_index = request.port_index as usize;
+
+        if request.scan_port_count > 0 {
+            // One paced pass over a fixed window of the shuffled port list. The
+            // remote drives repetition, so the same `port_index` rescans the
+            // same batch and `next_port_index` starts a fresh one.
+            let port_count = (request.scan_port_count as usize)
+                .min(MAX_HARD_SYM_SCAN_PORTS)
+                .min(self.shuffled_port_vec.len());
+            let interval = Duration::from_millis(
+                request
+                    .scan_packet_interval_ms
+                    .clamp(1, MAX_HARD_SYM_SCAN_PACKET_INTERVAL_MS) as u64,
+            );
+            let next_port_index = send_paced_symmetric_hole_punch_packet(
+                &self.shuffled_port_vec,
+                listener,
+                request.transaction_id,
+                &request.public_ips,
+                last_port_index,
+                port_count,
+                interval,
+            )
+            .await
+            .with_context(|| "failed to send paced symmetric hole punch packet")?;
+            return Ok(SendPunchPacketHardSymResponse {
+                next_port_index: next_port_index as u32,
+            });
+        }
+
         let round = request.round.max(1);
         let mut max_k2: u32 = rand::thread_rng().gen_range(600..800);
         if round > 2 {
@@ -854,6 +886,36 @@ where
         crate::foundation::time::sleep(Duration::from_millis(1)).await;
     }
     Ok(cur_port_idx % ports.len())
+}
+
+/// Sends one packet per port (per public IP) for `port_count` ports starting at
+/// `port_start_idx`, spacing ports by `interval` instead of bursting them.
+#[tracing::instrument(err, ret(level = tracing::Level::DEBUG), skip(ports, udp))]
+pub async fn send_paced_symmetric_hole_punch_packet<S>(
+    ports: &[u16],
+    udp: Arc<S>,
+    transaction_id: u32,
+    public_ips: &[Ipv4Addr],
+    port_start_idx: usize,
+    port_count: usize,
+    interval: Duration,
+) -> anyhow::Result<usize>
+where
+    S: VirtualUdpSocket + 'static,
+{
+    tracing::debug!("sending paced hard symmetric hole punching packet");
+    let base_idx = port_start_idx % ports.len();
+    let start = crate::foundation::time::Instant::now();
+    for i in 0..port_count {
+        crate::foundation::time::sleep_until(start + interval * i as u32).await;
+        let port = ports[(base_idx + i) % ports.len()];
+        for pub_ip in public_ips {
+            let addr = SocketAddr::V4(SocketAddrV4::new(*pub_ip, port));
+            let packet = new_hole_punch_packet(transaction_id, HOLE_PUNCH_PACKET_BODY_LEN);
+            udp.send_to(&packet.into_bytes(), addr).await?;
+        }
+    }
+    Ok((base_idx + port_count) % ports.len())
 }
 
 pub struct UdpBothEasySymPunchServer<R, T>

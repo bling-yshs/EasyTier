@@ -163,6 +163,34 @@ where
         Ok(())
     }
 
+    /// Sends exactly one packet from each socket, walking the sockets in order
+    /// and spreading the sends evenly over `spread`.
+    #[instrument(skip(data))]
+    pub async fn send_once_with_all_paced(
+        &self,
+        data: &[u8],
+        addr: SocketAddr,
+        spread: crate::foundation::time::Duration,
+    ) {
+        let sockets = self
+            .sockets
+            .iter()
+            .map(|s| s.value().clone())
+            .collect::<Vec<_>>();
+        if sockets.is_empty() {
+            return;
+        }
+
+        let gap = spread / sockets.len() as u32;
+        let start = crate::foundation::time::Instant::now();
+        for (idx, socket) in sockets.iter().enumerate() {
+            crate::foundation::time::sleep_until(start + gap * idx as u32).await;
+            if let Err(err) = socket.send_to(data, addr).await {
+                tracing::debug!(?err, ?addr, "failed to send paced hole punching packet");
+            }
+        }
+    }
+
     #[instrument(ret(level = Level::DEBUG))]
     pub fn try_fetch_punched_socket(&self, tid: u32) -> Option<PunchedUdpSocket<R::Socket>> {
         tracing::debug!(?tid, "try fetch punched socket");

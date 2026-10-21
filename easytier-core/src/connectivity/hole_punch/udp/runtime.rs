@@ -118,6 +118,10 @@ pub struct SendPunchPacketHardSym {
     pub transaction_id: u32,
     pub port_index: u32,
     pub round: u32,
+    /// Non-zero selects a single paced pass over this many ports instead of
+    /// the legacy random scan.
+    pub scan_port_count: u32,
+    pub scan_packet_interval_ms: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

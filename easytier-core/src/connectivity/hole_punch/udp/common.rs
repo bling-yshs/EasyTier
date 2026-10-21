@@ -71,6 +71,12 @@ impl UdpNatType {
         matches!(self, UdpNatType::Cone(_))
     }
 
+    /// NAT4 (hard symmetric) punching towards NAT3 (port-restricted cone),
+    /// which uses the fixed socket-rotation / paced-scan schedule.
+    pub fn is_nat4_to_nat3(&self, other: Self) -> bool {
+        self.is_hard_sym() && matches!(other, UdpNatType::Cone(NatType::PortRestricted))
+    }
+
     pub fn get_inc_of_easy_sym(&self) -> Option<bool> {
         match self {
             UdpNatType::EasySymmetric(_, inc) => Some(*inc),
