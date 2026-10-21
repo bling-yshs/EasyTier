@@ -8,7 +8,10 @@ use async_trait::async_trait;
 #[cfg(test)]
 use easytier_core::connectivity::stun::{StunInfoProvider, StunSocketMapper};
 use easytier_core::{
-    connectivity::stun::StunInfoCollector as CoreStunInfoCollector, socket::SocketContext,
+    connectivity::stun::{
+        StunInfoCollector as CoreStunInfoCollector, UdpNatTypeDetector as CoreUdpNatTypeDetector,
+    },
+    socket::SocketContext,
 };
 #[cfg(test)]
 use easytier_proto::common::{NatType, StunInfo};
@@ -18,6 +21,22 @@ use crate::host_runtime::{NativeHostRuntime, native_host_runtime};
 use crate::socket::udp::RuntimeUdpSocket;
 
 pub type StunInfoCollector = CoreStunInfoCollector<NativeHostRuntime, NativeHostRuntime>;
+pub type UdpNatTypeDetector = CoreUdpNatTypeDetector<NativeHostRuntime, NativeHostRuntime>;
+
+/// Builds a one-shot UDP NAT type detector on the process-wide native runtime.
+pub fn native_udp_nat_type_detector(
+    stun_server_hosts: Vec<String>,
+    max_ip_per_domain: u32,
+) -> UdpNatTypeDetector {
+    let runtime = native_host_runtime();
+    UdpNatTypeDetector::new(
+        runtime.clone(),
+        runtime,
+        SocketContext::default(),
+        stun_server_hosts,
+        max_ip_per_domain,
+    )
+}
 
 pub fn default_udp_stun_servers() -> Vec<String> {
     if cfg!(test) {
