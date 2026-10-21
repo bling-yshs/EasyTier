@@ -1,0 +1,39 @@
+name: EasyTier Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build Core, CLI and Web (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Prepare build environment
+        uses: ./.github/actions/prepare-build
+        with:
+          gui: false
+          pnpm: false
+          token: ${{ github.token }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-linux
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Build Core, CLI and Web
+        run: cargo build --locked --bins --package easytier --package easytier-web
